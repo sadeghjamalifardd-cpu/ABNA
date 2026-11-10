@@ -7,6 +7,7 @@ on:
 env:
   APP_NAME: "هیئت"
   APP_ID: "com.heyat.app"
+  APP_LOCK: "true"
 
 jobs:
   build:
@@ -24,6 +25,8 @@ jobs:
           gradle-version: "8.7"
 
       - name: Generate Android project
+        env:
+          RUN_NUM: ${{ github.run_number }}
         run: |
           set -e
           HTML_FILE=$(ls *.html | head -1)
@@ -50,6 +53,8 @@ jobs:
           </vector>
           EOF
           fi
+
+          if [ -f release.keystore ]; then cp release.keystore android/app/release.keystore; fi
 
           cd android
 
@@ -86,12 +91,28 @@ jobs:
                   applicationId "$APP_ID"
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
+                  versionCode $RUN_NUM
                   versionName "1.0"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
                   targetCompatibility JavaVersion.VERSION_17
+              }
+              signingConfigs {
+                  fixed {
+                      storeFile file('release.keystore')
+                      storePassword 'heyat1234'
+                      keyAlias 'key0'
+                      keyPassword 'heyat1234'
+                      storeType 'pkcs12'
+                  }
+              }
+              buildTypes {
+                  debug {
+                      if (file('release.keystore').exists()) {
+                          signingConfig signingConfigs.fixed
+                      }
+                  }
               }
           }
           EOF
@@ -171,6 +192,7 @@ jobs:
           package com.heyat.app;
 
           import android.app.Activity;
+          import android.app.KeyguardManager;
           import android.content.ContentValues;
           import android.content.Intent;
           import android.net.Uri;
@@ -179,6 +201,7 @@ jobs:
           import android.os.Environment;
           import android.provider.MediaStore;
           import android.util.Base64;
+          import android.view.View;
           import android.webkit.JavascriptInterface;
           import android.webkit.ValueCallback;
           import android.webkit.WebChromeClient;
@@ -197,6 +220,11 @@ jobs:
               private WebView web;
               private ValueCallback<Uri[]> filePathCb;
               private static final int REQ = 1;
+              private static final int REQ_LOCK = 2;
+              private static final boolean LOCK = __LOCK__;
+              private boolean unlocked = false;
+              private boolean authing = false;
+              private long stopTime = 0;
 
               @Override
               protected void onCreate(Bundle b) {
@@ -238,6 +266,45 @@ jobs:
                       }
                   });
                   web.loadUrl("file:///android_asset/index.html");
+                  if (LOCK) web.setVisibility(View.INVISIBLE);
+              }
+
+              @Override
+              protected void onStop() {
+                  super.onStop();
+                  if (unlocked) stopTime = System.currentTimeMillis();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (!LOCK) return;
+                  if (unlocked && System.currentTimeMillis() - stopTime < 60000) return;
+                  unlocked = false;
+                  web.setVisibility(View.INVISIBLE);
+                  askAuth();
+              }
+
+              private void unlock() {
+                  unlocked = true;
+                  stopTime = System.currentTimeMillis();
+                  web.setVisibility(View.VISIBLE);
+              }
+
+              private void askAuth() {
+                  if (authing) return;
+                  KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+                  if (km == null || !km.isDeviceSecure()) {
+                      unlock();
+                      return;
+                  }
+                  Intent i = km.createConfirmDeviceCredentialIntent("ورود به برنامه", "برای ورود هویت خود را تایید کنید");
+                  if (i == null) {
+                      unlock();
+                      return;
+                  }
+                  authing = true;
+                  startActivityForResult(i, REQ_LOCK);
               }
 
               private void inject() {
@@ -254,7 +321,81 @@ jobs:
 
               @Override
               protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == REQ_LOCK) {
+                      authing = false;
+                      if (res == RESULT_OK) unlock(); else finish();
+                      return;
+                  }
                   if (req == REQ && filePathCb != null) {
+                      filePathCb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                      filePathCb = null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) web.goBack(); else super.onBackPressed();
+              }
+
+              private void toast(final String m) {
+                  runOnUiThread(new Runnable() {
+                      public void run() { Toast.makeText(MainActivity.this, m, Toast.LENGTH_LONG).show(); }
+                  });
+              }
+
+              class Bridge {
+                  @JavascriptInterface
+                  public void saveFile(String name, String mime, String b64) {
+                      try {
+                          byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                          name = name.replaceAll("[/\\\\:*?\"<>|]", "_");
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                              v.put(MediaStore.Downloads.MIME_TYPE, mime);
+                              v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                              Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                              OutputStream o = getContentResolver().openOutputStream(uri);
+                              o.write(data);
+                              o.close();
+                              toast("ذخیره شد در پوشه Download: " + name);
+                          } else {
+                              File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                              File f = new File(dir, name);
+                              FileOutputStream o = new FileOutputStream(f);
+                              o.write(data);
+                              o.close();
+                              toast("ذخیره شد: " + f.getAbsolutePath());
+                          }
+                      } catch (Exception e) {
+                          toast("خطا در ذخیره فایل");
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void shareText(String t) {
+                      Intent i = new Intent(Intent.ACTION_SEND);
+                      i.setType("text/plain");
+                      i.putExtra(Intent.EXTRA_TEXT, t);
+                      Intent c = Intent.createChooser(i, null);
+                      c.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(c);
+                  }
+              }
+          }
+          EOF
+
+      - name: Apply lock setting
+        run: sed -i "s/__LOCK__/$APP_LOCK/" android/app/src/main/java/com/heyat/app/MainActivity.java
+
+      - name: Build
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk!= null) {
                       filePathCb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
                       filePathCb = null;
                   }
