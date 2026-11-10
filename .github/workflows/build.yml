@@ -1,0 +1,323 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  APP_NAME: "هیئت"
+  APP_ID: "com.heyat.app"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        run: |
+          set -e
+          HTML_FILE=$(ls *.html | head -1)
+          echo "Using $HTML_FILE"
+          mkdir -p android/app/src/main/assets
+          mkdir -p android/app/src/main/res/values
+          mkdir -p android/app/src/main/res/drawable
+          mkdir -p android/app/src/main/java/com/heyat/app
+          cp "$HTML_FILE" android/app/src/main/assets/index.html
+
+          if [ -f icon.png ]; then
+            cp icon.png android/app/src/main/res/drawable/ic_launcher.png
+          else
+            cat > android/app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp" android:height="96dp"
+              android:viewportWidth="96" android:viewportHeight="96">
+            <path android:fillColor="#0F766E"
+                android:pathData="M0,0h96v96h-96z"/>
+            <path android:fillColor="#FFFFFF"
+                android:pathData="M48,48m-30,0a30,30 0 1,0 60,0a30,30 0 1,0 -60,0"/>
+            <path android:fillColor="#0F766E"
+                android:pathData="M58,44m-26,0a26,26 0 1,0 52,0a26,26 0 1,0 -52,0"/>
+          </vector>
+          EOF
+          fi
+
+          cd android
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "WebApp"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<EOF
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.heyat.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "$APP_ID"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<EOF
+          <resources>
+              <string name="app_name">$APP_NAME</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@drawable/ic_launcher"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/assets/bridge.js <<'EOF'
+          (function () {
+            if (window.__bridgeInstalled) return;
+            window.__bridgeInstalled = true;
+            function save(name, blob) {
+              var r = new FileReader();
+              r.onloadend = function () {
+                var s = r.result;
+                var b64 = s.substring(s.indexOf(',') + 1);
+                Android.saveFile(name || 'file', blob.type || 'application/octet-stream', b64);
+              };
+              r.readAsDataURL(blob);
+            }
+            function handle(a) {
+              if (!a.hasAttribute('download')) return false;
+              var h = a.href || '';
+              var name = a.getAttribute('download') || 'file';
+              if (h.indexOf('blob:') === 0 || h.indexOf('data:') === 0) {
+                fetch(h).then(function (x) { return x.blob(); }).then(function (b) { save(name, b); });
+                return true;
+              }
+              return false;
+            }
+            var oc = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function () {
+              if (!handle(this)) oc.call(this);
+            };
+            document.addEventListener('click', function (e) {
+              var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+              if (a && handle(a)) e.preventDefault();
+            }, true);
+            navigator.canShare = function () { return true; };
+            navigator.share = function (d) {
+              d = d || {};
+              if (d.files && d.files.length) {
+                for (var i = 0; i < d.files.length; i++) save(d.files[i].name, d.files[i]);
+              } else {
+                var t = [d.title, d.text, d.url].filter(Boolean).join('\n');
+                Android.shareText(t);
+              }
+              return Promise.resolve();
+            };
+          })();
+          EOF
+
+          cat > app/src/main/java/com/heyat/app/MainActivity.java <<'EOF'
+          package com.heyat.app;
+
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+              private ValueCallback<Uri[]> filePathCb;
+              private static final int REQ = 1;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  web = new WebView(this);
+                  setContentView(web);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  web.addJavascriptInterface(new Bridge(), "Android");
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageFinished(WebView v, String url) {
+                          inject();
+                      }
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          String sc = u.getScheme();
+                          if ("file".equals(sc) || "blob".equals(sc) || "data".equals(sc) || "about".equals(sc)) return false;
+                          try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception e) { }
+                          return true;
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                          if (filePathCb != null) filePathCb.onReceiveValue(null);
+                          filePathCb = cb;
+                          try {
+                              startActivityForResult(p.createIntent(), REQ);
+                          } catch (Exception e) {
+                              filePathCb = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+                  web.loadUrl("file:///android_asset/index.html");
+              }
+
+              private void inject() {
+                  try {
+                      InputStream in = getAssets().open("bridge.js");
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096];
+                      int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      in.close();
+                      web.evaluateJavascript(bo.toString("UTF-8"), null);
+                  } catch (Exception e) { }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == REQ && filePathCb != null) {
+                      filePathCb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                      filePathCb = null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) web.goBack(); else super.onBackPressed();
+              }
+
+              private void toast(final String m) {
+                  runOnUiThread(new Runnable() {
+                      public void run() { Toast.makeText(MainActivity.this, m, Toast.LENGTH_LONG).show(); }
+                  });
+              }
+
+              class Bridge {
+                  @JavascriptInterface
+                  public void saveFile(String name, String mime, String b64) {
+                      try {
+                          byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                          name = name.replaceAll("[/\\\\:*?\"<>|]", "_");
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                              v.put(MediaStore.Downloads.MIME_TYPE, mime);
+                              v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                              Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                              OutputStream o = getContentResolver().openOutputStream(uri);
+                              o.write(data);
+                              o.close();
+                              toast("ذخیره شد در پوشه Download: " + name);
+                          } else {
+                              File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                              File f = new File(dir, name);
+                              FileOutputStream o = new FileOutputStream(f);
+                              o.write(data);
+                              o.close();
+                              toast("ذخیره شد: " + f.getAbsolutePath());
+                          }
+                      } catch (Exception e) {
+                          toast("خطا در ذخیره فایل");
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void shareText(String t) {
+                      Intent i = new Intent(Intent.ACTION_SEND);
+                      i.setType("text/plain");
+                      i.putExtra(Intent.EXTRA_TEXT, t);
+                      Intent c = Intent.createChooser(i, null);
+                      c.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(c);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
