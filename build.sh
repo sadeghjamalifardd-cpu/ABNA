@@ -407,7 +407,7 @@ public class Scheduler {
     static long next(int type) {
         long now = System.currentTimeMillis();
         if (type == BACKUP) {
-            android.icu.util.PersianCalendar pc = new android.icu.util.PersianCalendar();
+            android.icu.util.Calendar pc = android.icu.util.Calendar.getInstance(new android.icu.util.ULocale("fa_IR@calendar=persian"));
             pc.set(android.icu.util.Calendar.HOUR_OF_DAY, BACKUP_HOUR);
             pc.set(android.icu.util.Calendar.MINUTE, 0);
             pc.set(android.icu.util.Calendar.SECOND, 0);
