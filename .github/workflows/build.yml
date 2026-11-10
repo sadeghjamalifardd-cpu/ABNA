@@ -8,6 +8,10 @@ env:
   APP_NAME: "هیئت"
   APP_ID: "com.heyat.app"
   APP_LOCK: "true"
+  FRI_HOUR: "18"
+  THU_HOUR: "17"
+  BACKUP_DAY: "1"
+  BACKUP_HOUR: "10"
 
 jobs:
   build:
@@ -53,6 +57,16 @@ jobs:
           </vector>
           EOF
           fi
+
+          cat > android/app/src/main/res/drawable/ic_stat.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+            <path android:fillColor="#FFFFFF"
+                android:pathData="M12,2a10,10 0 1,0 0,20a10,10 0 0,0 0,-20z M15,5a7,7 0 1,1 0,14a7,7 0 0,1 0,-14z"
+                android:fillType="evenOdd"/>
+          </vector>
+          EOF
 
           if [ -f release.keystore ]; then cp release.keystore android/app/release.keystore; fi
 
@@ -125,6 +139,8 @@ jobs:
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <application
                   android:label="@string/app_name"
                   android:icon="@drawable/ic_launcher"
@@ -139,6 +155,12 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <receiver android:name=".NotifReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      </intent-filter>
+                  </receiver>
               </application>
           </manifest>
           EOF
@@ -195,6 +217,7 @@ jobs:
           import android.app.KeyguardManager;
           import android.content.ContentValues;
           import android.content.Intent;
+          import android.content.pm.PackageManager;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
@@ -258,6 +281,199 @@ jobs:
                           filePathCb = cb;
                           try {
                               startActivityForResult(p.createIntent(), REQ);
+                          } catch (Exception e) {
+                              filePathCb = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+                  Scheduler.scheduleAll(this);
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 3);
+                  }
+                  web.loadUrl("file:///android_asset/index.html");
+                  if (LOCK) web.setVisibility(View.INVISIBLE);
+              }
+
+              @Override
+              protected void onStop() {
+                  super.onStop();
+                  if (unlocked) stopTime = System.currentTimeMillis();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (!LOCK) return;
+                  if (unlocked && System.currentTimeMillis() - stopTime < 60000) return;
+                  unlocked = false;
+                  web.setVisibility(View.INVISIBLE);
+                  askAuth();
+              }
+
+              private void unlock() {
+                  unlocked = true;
+                  stopTime = System.currentTimeMillis();
+                  web.setVisibility(View.VISIBLE);
+              }
+
+              private void askAuth() {
+                  if (authing) return;
+                  KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+                  if (km == null || !km.isDeviceSecure()) {
+                      unlock();
+                      return;
+                  }
+                  Intent i = km.createConfirmDeviceCredentialIntent("ورود به برنامه", "برای ورود هویت خود را تایید کنید");
+                  if (i == null) {
+                      unlock();
+                      return;
+                  }
+                  authing = true;
+                  startActivityForResult(i, REQ_LOCK);
+              }
+
+              private void inject() {
+                  try {
+                      InputStream in = getAssets().open("bridge.js");
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096];
+                      int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      in.close();
+                      web.evaluateJavascript(bo.toString("UTF-8"), null);
+                  } catch (Exception e) { }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == REQ_LOCK) {
+                      authing = false;
+                      if (res == RESULT_OK) unlock(); else finish();
+                      return;
+                  }
+                  if (req == REQ && filePathCb != null) {
+                      filePathCb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                      filePathCb = null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) web.goBack(); else super.onBackPressed();
+              }
+
+              private void toast(final String m) {
+                  runOnUiThread(new Runnable() {
+                      public void run() { Toast.makeText(MainActivity.this, m, Toast.LENGTH_LONG).show(); }
+                  });
+              }
+
+              class Bridge {
+                  @JavascriptInterface
+                  public void saveFile(String name, String mime, String b64) {
+                      try {
+                          byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                          name = name.replaceAll("[/\\\\:*?\"<>|]", "_");
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                              v.put(MediaStore.Downloads.MIME_TYPE, mime);
+                              v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                              Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                              OutputStream o = getContentResolver().openOutputStream(uri);
+                              o.write(data);
+                              o.close();
+                              toast("ذخیره شد در پوشه Download: " + name);
+                          } else {
+                              File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                              File f = new File(dir, name);
+                              FileOutputStream o = new FileOutputStream(f);
+                              o.write(data);
+                              o.close();
+                              toast("ذخیره شد: " + f.getAbsolutePath());
+                          }
+                      } catch (Exception e) {
+                          toast("خطا در ذخیره فایل");
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void shareText(String t) {
+                      Intent i = new Intent(Intent.ACTION_SEND);
+                      i.setType("text/plain");
+                      i.putExtra(Intent.EXTRA_TEXT, t);
+                      Intent c = Intent.createChooser(i, null);
+                      c.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(c);
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/heyat/app/Scheduler.java <<'EOF'
+          package com.heyat.app;
+
+          import android.app.AlarmManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import java.util.Calendar;
+
+          public class Scheduler {
+              static final int FRI = 1;
+              static final int THU = 2;
+              static final int BACKUP = 3;
+              static final int FRI_HOUR = __FRI_HOUR__;
+              static final int THU_HOUR = __THU_HOUR__;
+              static final int BACKUP_DAY = __BACKUP_DAY__;
+              static final int BACKUP_HOUR = __BACKUP_HOUR__;
+
+              static void scheduleAll(Context c) {
+                  schedule(c, FRI);
+                  schedule(c, THU);
+                  schedule(c, BACKUP);
+              }
+
+              static long next(int type) {
+                  long now = System.currentTimeMillis();
+                  if (type == BACKUP) {
+                      android.icu.util.PersianCalendar pc = new android.icu.util.PersianCalendar();
+                      pc.set(android.icu.util.Calendar.HOUR_OF_DAY, BACKUP_HOUR);
+                      pc.set(android.icu.util.Calendar.MINUTE, 0);
+                      pc.set(android.icu.util.Calendar.SECOND, 0);
+                      pc.set(android.icu.util.Calendar.MILLISECOND, 0);
+                      pc.set(android.icu.util.Calendar.DAY_OF_MONTH, BACKUP_DAY);
+                      if (pc.getTimeInMillis() <= now) {
+                          pc.add(android.icu.util.Calendar.MONTH, 1);
+                          pc.set(android.icu.util.Calendar.DAY_OF_MONTH, BACKUP_DAY);
+                      }
+                      return pc.getTimeInMillis();
+                  }
+                  Calendar cal = Calendar.getInstance();
+                  cal.set(Calendar.DAY_OF_WEEK, type == FRI ? Calendar.FRIDAY : Calendar.THURSDAY);
+                  cal.set(Calendar.HOUR_OF_DAY, type == FRI ? FRI_HOUR : THU_HOUR);
+                  cal.set(Calendar.MINUTE, 0);
+                  cal.set(Calendar.SECOND, 0);
+                  cal.set(Calendar.MILLISECOND, 0);
+                  if (cal.getTimeInMillis() <= now) cal.add(Calendar.DAY_OF_YEAR, 7);
+                  return cal.getTimeInMillis();
+              }
+
+              static void schedule(Context c, int type) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  if (am == null) return;
+                  Intent i = new Intent(c, NotifReceiver.class);
+                  i.setAction("com.heyat.app.NOTIF");
+                  i.putExtra("type", type);
+                  PendingIntent pi = PendingIntent.getBroadcast(c, type, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next(type), pi);
+              }
+          }
+          EOF
+
+    startActivityForResult(p.createIntent(), REQ);
                           } catch (Exception e) {
                               filePathCb = null;
                               return false;
